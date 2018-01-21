@@ -6,6 +6,8 @@ import urlparse
 import zlib
 import time
 import pickle
+import sys
+import threading
 from datetime import datetime, timedelta, date
 from bs4 import BeautifulSoup
 from pymongo import MongoClient
@@ -25,7 +27,7 @@ AREA_DICT = {
 }
 
 AREA = (
-    'jianggangqu', 'binjiangqu', 'xihuqu', 'shangchengqu',
+    'jiangganqu', 'binjiangqu', 'xihuqu', 'shangchengqu',
     'yuhangqu', 'gongshuqu', 'xiachengqu', 'xiaoshanqu'
 )
 
@@ -39,8 +41,9 @@ class MongoCache(object):
     """
     def __init__(self, expires_days=30):
         self.client = MongoClient("mongodb://crawl:mongo666@localhost:27017", authSource='fivehouse', connect=False)
-        self.db = self.client.fivehouses
+        self.db = self.client.fivehouse
         self.db.webpages.create_index('timestamp', expireAfterSeconds=timedelta(expires_days).total_seconds())
+        self.lock = threading.RLock()
 
     def __getitem__(self, url):
         record = self.db.webpages.find_one({'_id': url})
@@ -51,9 +54,11 @@ class MongoCache(object):
             raise KeyError(url + 'does not exist')
 
     def __setitem__(self, url, result):
+        self.lock.acquire()
         record = {'result': Binary(zlib.compress(pickle.dumps(result))), 'timestamp': datetime.utcnow()}
         # record = {'html': html, 'timestamp': datetime.utcnow()}
         self.db.webpages.update({'_id': url}, {'$set': record}, upsert=True)
+        self.lock.release()
 
     def clear(self):
         self.db.webpages.drop()
@@ -88,28 +93,33 @@ class Download(object):
         self.num_retries = num_retries
 
     def __call__(self, url):
-        result = None
+        html = None
         if self.cache:
             try:
                 result = self.cache[url]
+                html = result['html'].decode("utf-8", 'replace')
             except KeyError:
                 pass
-            else:
-                if self.num_retries > 0 and 500 < result['code'] < 600:
-                    # 如果设置再次下载且服务器错误则重新下载
-                    result = None
-        if result is None:
+        if html is None:
             self.throttle.wait(url)
             result = self.download(url)
+            html = result['html']
+            code = result['code']
+            if code != 200:
+                print'website from {} start to forbid visiting, please wait for 20 minutes!'.format(url)
+                time.sleep(60)
+                if self.num_retries > 0:
+                    # 如果设置再次下载且服务器错误则重新下载
+                    self.num_retries -= 1
+                    self.__call__(url)
+                else:
+                    print'website seems not to be access for a long time, this program was stopped!'
+                    html = None
             if self.cache:
                 self.cache[url] = result
-        try:
-            return result['html'].decode('utf-8')
-        except UnicodeDecodeError:
-            return result['html']
+        return html
 
-    @staticmethod
-    def download(url, user_agent=USER_AGENT):
+    def download(self, url, user_agent=USER_AGENT):
         print'downloading url {}'.format(url)
         headers = {
             'User-Agent': user_agent
@@ -121,7 +131,7 @@ class Download(object):
             response = opener.open(request)
             html = response.read()
             code = response.code
-            # cache[url] = {'html': html}
+            self.cache[url] = {'html': html, 'code': code}
         except urllib2.HTTPError as e:
             if hasattr(e, 'code'):
                 code = e.code
@@ -192,6 +202,7 @@ class HouseCrawl(object):
                     result_info.append([city, area, house_type, layout, square, price, put_date, address, house_url])
         else:
             print'html {} download failed!'.format(url)
+            sys.exit()
         return result_info
 
     def house_page_info(self, city, house_type, area):
@@ -248,7 +259,7 @@ def threading_crawl(filename='house.csv', max_threads=5, sleep_time=5):
     def crawl_process():
         try:
             info_args = crawl_queue.pop()
-        except KeyError:
+        except IndexError:
             print('it has been done!')
         else:
             each_info = house.house_info(info_args[0], info_args[1], info_args[2], info_args[3])
@@ -273,5 +284,5 @@ if __name__ == '__main__':
     threading_crawl()
 
     # house_crawl = HouseCrawl()
-    # info = house_crawl.house_info('hz', 'ershoufang', 'yuhangqu', '152')
+    # info = house_crawl.house_info('hz', 'ershoufang', 'xiaoshanqu', '59')
     # print'it is done'
