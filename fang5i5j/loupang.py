@@ -8,11 +8,16 @@ import time
 import pickle
 import sys
 import threading
+import random
 from datetime import datetime, timedelta, date
 from bs4 import BeautifulSoup
 from pymongo import MongoClient
 from threading import Thread
 from bson.binary import Binary
+from gzip import GzipFile
+from StringIO import StringIO
+
+from kuaidaili import KuaidailiProxy
 
 USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/63.0.3239.132 Safari/537.36'
 AREA_DICT = {
@@ -87,10 +92,13 @@ class Throttle(object):
 
 
 class Download(object):
-    def __init__(self, delay=1, num_retries=5):
+    def __init__(self, delay=1, download_retries=5, proxy_retries=5):
         self.throttle = Throttle(delay)
         self.cache = MongoCache()
-        self.num_retries = num_retries
+        self.num_retries = download_retries
+        self.proxy_retries = proxy_retries
+        self.proxy = KuaidailiProxy('https://hz.5i5j.com').proxy
+        self.use_proxy = False
 
     def __call__(self, url):
         html = None
@@ -104,42 +112,76 @@ class Download(object):
             self.throttle.wait(url)
             result = self.download(url)
             html = result['html']
-            code = result['code']
-            if code != 200:
-                print'website from {} start to forbid visiting, please wait for 20 minutes!'.format(url)
-                time.sleep(60)
-                if self.num_retries > 0:
-                    # 如果设置再次下载且服务器错误则重新下载
-                    self.num_retries -= 1
-                    self.__call__(url)
-                else:
-                    print'website seems not to be access for a long time, this program was stopped!'
-                    html = None
             if self.cache:
                 self.cache[url] = result
+        if html is not None:
+            # tree = BeautifulSoup(html, 'lxml')
+            # name = tree.head.contents[0].name
+            if re.match(u'<html><script>', html):
+                self.use_proxy = True
+                if self.proxy_retries > 0:
+                    self.proxy_retries -= 1
+                    self.cache_update(url)
+                    return self.__call__(url)
+                else:
+                    print 'the website{} still can not be access, dammit!'.format(url)
         return html
+
+    def cache_update(self, url):
+        self.throttle.wait(url)
+        result = self.download(url)
+        if self.cache:
+            self.cache[url] = result
 
     def download(self, url, user_agent=USER_AGENT):
         print'downloading url {}'.format(url)
         headers = {
-            'User-Agent': user_agent
+            'User-Agent': user_agent,
+            'Connection': 'keep-alive',
+            'Accept': 'text/html,application/xhtml+xml,application/xml',
+            'Accept-Encoding': 'gzip, deflate',
+            'Accept-Language': 'zh-CN,zh'
         }
         request = urllib2.Request(url, headers=headers)
         opener = urllib2.build_opener()
         html = None
+        code = None
+        if self.use_proxy:
+            proxy_params = {'http': random.choice(self.proxy)}
+            opener.add_handler(urllib2.ProxyHandler(proxy_params))
         try:
             response = opener.open(request)
             html = response.read()
             code = response.code
-            self.cache[url] = {'html': html, 'code': code}
+            info = response.info().get('Content-Encoding')
+            if info == 'gzip':
+                html = self._gzip(html)
+            elif info == 'deflate':
+                html = self._deflate(html)
         except urllib2.HTTPError as e:
             if hasattr(e, 'code'):
                 code = e.code
-                print'{} error: {}'.format(e.code, e.reason)
+                if self.num_retries > 0 and 500 < code < 600:
+                    self.num_retries -= 1
+                    return self.download(url, user_agent)
+                else:
+                    print'{} error: {}'.format(e.code, e.reason)
             else:
-                code = 501
-                print'download error!'
+                print'{} error: {}'.format(e.code, e.reason)
         return {'html': html, 'code': code}
+
+    @staticmethod
+    def _gzip(data):
+        buf = StringIO(data)
+        f = GzipFile(fileobj=buf)
+        return f.read()
+
+    @staticmethod
+    def _deflate(data):
+        try:
+            return zlib.decompress(data, wbits=-zlib.MAX_WBITS)
+        except zlib.error:
+            return zlib.decompress(data)
 
 
 class HouseCrawl(object):
@@ -282,7 +324,8 @@ def threading_crawl(filename='house.csv', max_threads=5, sleep_time=5):
 
 if __name__ == '__main__':
     threading_crawl()
-
+    # C = MongoCache()
+    # C.clear()
     # house_crawl = HouseCrawl()
-    # info = house_crawl.house_info('hz', 'ershoufang', 'xiaoshanqu', '59')
+    # information = house_crawl.house_info('hz', 'ershoufang', 'xiaoshanqu', '78')
     # print'it is done'
